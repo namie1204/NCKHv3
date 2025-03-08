@@ -27,26 +27,74 @@
 #include "sms.h"
 #include "string.h"
 #include "stdio.h"
+#include "stdint.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum
+{
+  STATE_INIT = 0,
+  STATE_IDLE,
+  STATE_RUN,
+  STATE_ERROR,
+  STATE_SHUTDOWN,
+  STATE_STOP,
+  STATE_MAX
+} SystemState_t;
 
+typedef enum
+{
+  EVENT_INIT_SUCCESS = 0,
+  EVENT_INIT_FAIL,
+  EVENT_START_SUCCESS,
+  EVENT_START_FAIL,
+  EVENT_ERROR_OCCUR,
+  EVENT_SHUTDOWN_REQUEST,
+  EVENT_SHUTDOWN_FAIL,
+  EVENT_SHUTDOWN_SUCCESS,
+  EVENT_RESET,
+  EVENT_FORCE_STOP,
+  EVENT_MAX
+} Event_t;
+
+typedef enum
+{
+  R_OK = 0,
+  R_ERROR,
+  R_MAX,
+} status_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define MAX_RESET_COUNT 3
-#define CHECK_INTERVAL 10
-#define MAX_PHONE_NUMBERS 1
-RadarData data;
-static uint8_t alertSent = 0;
-uint32_t startTime = 0; // Luu thoi gian bat dau kiem tra
-uint8_t foundChild = 0; // Danh dau phat hien tre
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+#define MAX_RESET_COUNT 3
+#define CHECK_INTERVAL 10
+#define MAX_PHONE_NUMBERS 1
+#define ON 1  // 1: ON, 0: OFF
+#define OFF 0 // 1: ON, 0: OFF
+#define TRUE 1
+#define FALSE 0
+#define PRESS 0
+#define RELEASE 1
+#define DEBUG_BUFFER_SIZE 128
+#define DEBUG_UART
+#ifdef DEBUG_UART
+#define DEBUG_PRINT(fmt, ...)                                                           \
+  do                                                                                    \
+  {                                                                                     \
+    char debug_buf[DEBUG_BUFFER_SIZE];                                                  \
+    sprintf(debug_buf, fmt, ##__VA_ARGS__);                                             \
+    HAL_UART_Transmit(&huart6, (uint8_t *)debug_buf, strlen(debug_buf), HAL_MAX_DELAY); \
+  } while (0)
+#else
+#define DEBUG_PRINT(fmt, ...) // Không làm gì nếu DEBUG_UART chưa bật
+#endif
 
 /* USER CODE END PM */
 
@@ -59,61 +107,88 @@ UART_HandleTypeDef huart3;
 UART_HandleTypeDef huart6;
 
 /* USER CODE BEGIN PV */
-typedef enum
-{
-  STATE_INIT,
-  STATE_IDLE,
-  STATE_RUN,
-  STATE_ERROR,
-  STATE_SHUTDOWN,
-  STATE_STOP
-} SystemState_t;
-
-typedef enum
-{
-  EVENT_INIT_SUCCESS,
-  EVENT_INIT_FAIL,
-  EVENT_START_REQUEST,
-  EVENT_START_FAIL,
-  EVENT_ERROR_OCCUR,
-  EVENT_SHUTDOWN_REQUEST,
-  EVENT_SHUTDOWN_FAIL,
-  EVENT_SHUTDOWN_SUCCESS,
-  EVENT_RESET,
-  EVENT_FORCE_STOP
-} Event_t;
-
 SystemState_t currentState = STATE_INIT;
+SystemState_t next_State = STATE_INIT;
+Event_t event = EVENT_INIT_FAIL;
+RadarData data;
+static uint8_t alertSent = 0;
+uint32_t startTime = 0; // Luu thoi gian bat dau kiem tra
+uint8_t foundChild = 0; // Danh dau phat hien tre
 
 uint8_t reset_count = 0;
-uint8_t childDetected = 0;  // 0: ko co tre, 1: phat hien tre
-uint8_t vehicleRunning = 0; // 0: xe dung, 1: xe chay
+uint8_t childDetected = 0;    // 0: ko co tre, 1: phat hien tre
+uint8_t vehicleRunning = OFF; // 0: xe dung, 1: xe chay
+uint8_t shutdown_request = FALSE;
 
 char *phoneNumbers[] = {"+84833426235"};
 uint8_t phoneCount = sizeof(phoneNumbers) / sizeof(phoneNumbers[0]);
 
-void transitionState(Event_t event)
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_USART6_UART_Init(void);
+static void MX_IWDG_Init(void);
+/* USER CODE BEGIN PFP */
+
+status_t Deinit_all(void);
+void execute_action(void);
+void judge_state(void);
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+void execute_action(void)
 {
+  status_t ret = R_OK;
   switch (currentState)
   {
   case STATE_INIT:
+  {
     HLK_LD6002_Init(&huart1);
     ESP32UART_Init(&huart2);
     SMS_Init(&huart3);
 
-    transitionState(EVENT_INIT_SUCCESS);
-    break;
-
-  case STATE_IDLE:
-    vehicleRunning = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0);
-    if (vehicleRunning)
+    if (ret == R_OK)
     {
-      transitionState(EVENT_START_REQUEST);
+      event = EVENT_INIT_SUCCESS;
+    }
+    else if (ret == R_ERROR)
+    {
+      event = EVENT_INIT_FAIL;
     }
     break;
-  case STATE_RUN:
+  }
+
+  case STATE_IDLE:
+  {
     vehicleRunning = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0);
-    if (vehicleRunning)
+
+    if (vehicleRunning == OFF)
+    {
+      event = EVENT_START_SUCCESS;
+    }
+    else
+    {
+      event = EVENT_START_FAIL;
+    }
+    break;
+  }
+
+  case STATE_RUN:
+  {
+    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == PRESS)
+    {
+      shutdown_request = TRUE;
+
+      event = EVENT_SHUTDOWN_REQUEST;
+    }
+    else if (shutdown_request == FALSE)
     {
       HLK_LD6002_ProcessData();
       data = HLK_LD6002_GetRadarData();
@@ -164,68 +239,141 @@ void transitionState(Event_t event)
           }
           ESP32UART_SendData("ALERT_CHILD_DETECTED");
         }
-        else
-        {
-          transitionState(EVENT_SHUTDOWN_REQUEST);
-        }
       }
     }
-    else
-    {
-      transitionState(EVENT_START_REQUEST);
-    }
-    break;
 
+    break;
+  }
   case STATE_ERROR:
-    if (reset_count < MAX_RESET_COUNT)
-    {
-      reset_count++;
-      HAL_NVIC_SystemReset(); // Reset
-    }
-    else
-    {
-      transitionState(EVENT_SHUTDOWN_REQUEST);
-    }
+    /* Dev after handle EEPROM */
+
+    // if (reset_count < MAX_RESET_COUNT)
+    // {
+    //   reset_count++;
+    //   HAL_NVIC_SystemReset(); // Reset
+    // }
+    // else
+    // {
+    //   event = EVENT_FORCE_STOP;
+    // }
+
+    HAL_NVIC_SystemReset(); // Reset
+
     break;
 
   case STATE_SHUTDOWN:
-    ESP32UART_SendData("System shutting down...");
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); // Tat nguon
+    ret = Deinit_all();
+
+    if (ret == R_OK)
+    {
+      event = EVENT_SHUTDOWN_SUCCESS;
+    }
+    else if (ret == R_ERROR)
+    {
+      event = EVENT_SHUTDOWN_FAIL;
+    }
+    // ESP32UART_SendData("System shutting down...");
+    // HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); // Tat nguon
 
     // Standby Mode
-    HAL_PWR_EnableWakeUpPin(PWR_WAKEUP_PIN1);
-    HAL_PWR_EnterSTANDBYMode();
+    // HAL_PWR_EnableWakeUpPin(PWR_WAKEUP_PIN1);
+    // HAL_PWR_EnterSTANDBYMode();
     break;
   case STATE_STOP:
 
     ESP32UART_SendData("System Stopped\r\n");
 
-    HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
-
-    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0) == GPIO_PIN_SET)
-    {
-      currentState = STATE_RUN;
-    }
+    // HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
     break;
   }
 }
-/* USER CODE END PV */
 
-/* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_USART1_UART_Init(void);
-static void MX_USART2_UART_Init(void);
-static void MX_USART3_UART_Init(void);
-static void MX_USART6_UART_Init(void);
-static void MX_IWDG_Init(void);
-/* USER CODE BEGIN PFP */
+void judge_state(void)
+{
 
-/* USER CODE END PFP */
+  switch (currentState)
+  {
+  case STATE_INIT:
+    if (event == EVENT_INIT_SUCCESS)
+    {
+      DEBUG_PRINT("Init success\r\n");
+      next_State = STATE_IDLE;
+    }
+    else if (event == EVENT_INIT_FAIL)
+    {
+      DEBUG_PRINT("Init fail\r\n");
+      next_State = STATE_ERROR;
+    }
+    break;
 
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
+  case STATE_IDLE:
+    if (event == EVENT_START_SUCCESS)
+    {
+      DEBUG_PRINT("Start success\r\n");
+      next_State = STATE_RUN;
+    }
+    else if (event == EVENT_START_FAIL)
+    {
+      DEBUG_PRINT("Start fail\r\n");
+      next_State = STATE_ERROR;
+    }
+    break;
+  case STATE_RUN:
+    if (event == EVENT_SHUTDOWN_REQUEST)
+    {
+      DEBUG_PRINT("Shutdown request\r\n");
+      next_State = STATE_SHUTDOWN;
+    }
+    else if (event == EVENT_ERROR_OCCUR)
+    {
+      DEBUG_PRINT("Error occur\r\n");
+      next_State = STATE_ERROR;
+    }
+    break;
 
+  case STATE_SHUTDOWN:
+    if (event == EVENT_SHUTDOWN_SUCCESS)
+    {
+      DEBUG_PRINT("Shutdown success\r\n");
+      next_State = STATE_STOP;
+    }
+    else if (event == EVENT_SHUTDOWN_FAIL)
+    {
+      DEBUG_PRINT("Shutdown fail\r\n");
+      next_State = STATE_ERROR;
+    }
+    break;
+
+  case STATE_ERROR:
+    if (event == EVENT_FORCE_STOP)
+    {
+      DEBUG_PRINT("Force stop\r\n");
+      next_State = STATE_STOP;
+    }
+    else if (event == EVENT_RESET)
+    {
+      DEBUG_PRINT("Reset\r\n");
+      next_State = STATE_INIT;
+    }
+    break;
+
+  case STATE_STOP:
+    /* Do nothing*/
+    break;
+  }
+  currentState = next_State;
+}
+
+status_t Deinit_all(void)
+{
+  status_t ret = R_OK;
+  /* TO DO */
+
+  // ESP32UART_Deinit();
+  // HLK_LD6002_Deinit();
+  // SMS_Deinit();
+  return ret;
+}
 /* USER CODE END 0 */
 
 /**
@@ -263,41 +411,45 @@ int main(void)
   MX_USART6_UART_Init();
   MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
-
+  DEBUG_PRINT("hhhhh hhhh\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    /* Update state*/
+    judge_state();
+
     switch (currentState)
     {
     case STATE_INIT:
 
-      transitionState(EVENT_INIT_SUCCESS);
+      execute_action();
       break;
 
     case STATE_IDLE:
 
-      transitionState(EVENT_START_REQUEST);
+      execute_action();
       break;
 
     case STATE_RUN:
 
-      transitionState(EVENT_ERROR_OCCUR);
+      execute_action();
       break;
 
     case STATE_ERROR:
 
-      transitionState(EVENT_RESET);
+      execute_action();
       break;
 
     case STATE_SHUTDOWN:
 
-      transitionState(EVENT_SHUTDOWN_SUCCESS);
+      execute_action();
       break;
 
     case STATE_STOP:
+      execute_action();
       return 0;
 
       /* USER CODE END WHILE */
